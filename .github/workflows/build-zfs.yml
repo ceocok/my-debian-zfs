@@ -16,6 +16,10 @@ jobs:
     container:
       image: debian:bookworm
       options: --privileged
+    # 关键：强制整个构建环境使用标准的 bash 执行脚本，避免退回 dash
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: 检出仓库代码
@@ -32,7 +36,7 @@ jobs:
           
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms zfs-dkms git
+            build-essential dkms zfs-dkms git bash
 
       - name: 执行全自动编译与打包
         run: |
@@ -96,7 +100,7 @@ jobs:
 
             find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
             
-            # 写入元数据 metadata.txt（采用标准缩进 echo 写入）
+            # 写入元数据 metadata.txt
             echo "kernel_version=${kver}" > "${PKG_DIR}/metadata.txt"
             echo "module_path=updates/dkms" >> "${PKG_DIR}/metadata.txt"
             echo "zfs_version=${ZFS_VER}" >> "${PKG_DIR}/metadata.txt"
