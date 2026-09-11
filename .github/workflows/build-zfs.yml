@@ -523,8 +523,12 @@ jobs:
           rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
           apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+            libc6=2.31-13+deb11u11 libc-bin=2.31-13+deb11u11 perl-base=5.32.1-4+deb11u3
+
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc zfs-dkms
+            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
+            linux-kbuild-5.10 linux-compiler-gcc-10-x86 zfs-dkms
 
           chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
 
@@ -629,6 +633,9 @@ jobs:
           rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
           apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+            libc6=2.31-13+deb11u11 libc-bin=2.31-13+deb11u11 perl-base=5.32.1-4+deb11u3
+
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
             linux-kbuild-5.10 linux-compiler-gcc-10-x86 zfs-dkms
