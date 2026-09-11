@@ -28,13 +28,19 @@ jobs:
       - name: 配置编译基础环境与 ZFS 驱动
         run: |
           set -e
-          sed -i -E 's/(Components:.*)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-          sed -i -E 's/(deb.*main)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list 2>/dev/null || true
-          echo "deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware" > /etc/apt/sources.list.d/backports.list
+          cat << 'EOF' > /etc/apt/sources.list
+          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
+          EOF
+          rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3
+            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
+            linux-kbuild-6.1 linux-compiler-gcc-12-x86
+
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             -t bookworm-backports zfs-dkms
 
@@ -44,16 +50,21 @@ jobs:
         run: |
           set -e
           mkdir -p output
-          ZFS_VER=$(ls -d /usr/src/zfs-* 2>/dev/null | head -n1 | sed 's|.*/zfs-||')
-          echo "====> 检测到 ZFS DKMS 版本: ${ZFS_VER} <===="
 
           python3 - << 'EOF'
-          import os, sys, re, urllib.request, subprocess
+          import os, sys, re, glob, urllib.request, subprocess
 
           REPO = os.environ.get("GITHUB_REPOSITORY", "")
-          ZFS_VER = os.environ.get("ZFS_VER", "")
 
-          # 探测包在 Release 中是否已存在
+          # 1. 自动定位 ZFS DKMS 源码版本号
+          zfs_dirs = glob.glob("/usr/src/zfs-*")
+          if not zfs_dirs:
+              print("[-] 错误: 未在 /usr/src/ 中找到 zfs 源码目录")
+              sys.exit(1)
+          ZFS_VER = os.path.basename(zfs_dirs[0]).replace("zfs-", "")
+          print(f"====> 检测到 ZFS DKMS 版本: {ZFS_VER} <====")
+
+          # 2. 探测包在 Release 中是否已存在（已存在则秒跳过）
           def is_already_released(kver):
               if not REPO:
                   return False
@@ -61,7 +72,7 @@ jobs:
               res = subprocess.run(["curl", "-sSfL", "-I", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               return res.returncode == 0
 
-          # 从 snapshot.debian.org 自动解析并下载 deb
+          # 3. 从 snapshot.debian.org 解析并安装 deb
           def install_snapshot_headers(kver):
               pkg_url = f"https://snapshot.debian.org/binary/linux-headers-{kver}/"
               req = urllib.request.Request(pkg_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -107,11 +118,11 @@ jobs:
               subprocess.run(["curl", "-sSL", "--retry", "3", common_url, "-o", "/tmp/common.deb"], check=True)
               subprocess.run(["curl", "-sSL", "--retry", "3", arch_url, "-o", "/tmp/arch.deb"], check=True)
 
-              subprocess.run(["dpkg", "-i", "/tmp/common.deb", "/tmp/arch.deb"], check=False)
-              subprocess.run(["apt-get", "-f", "install", "-y"], check=True)
-              return True
+              # 使用 apt-get install 统一安全安装本地 deb
+              res = subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", "/tmp/common.deb", "/tmp/arch.deb"])
+              return res.returncode == 0
 
-          # 遍历编译 26 到 46
+          # 4. 遍历编译 26 到 46
           for num in range(26, 47):
               for flavor in ["amd64", "cloud-amd64"]:
                   kver = f"6.1.0-{num}-{flavor}"
@@ -125,7 +136,7 @@ jobs:
                   if not install_snapshot_headers(kver):
                       continue
 
-                  print(f"[+] 开始 DKMS 编译: {kver}...")
+                  print(f"[+] 开始 DKMS 编译: {kver} (ZFS: {ZFS_VER})...")
                   subprocess.run(f"dkms remove zfs/{ZFS_VER} -k {kver} 2>/dev/null || true", shell=True)
                   res_build = subprocess.run(f"dkms build zfs/{ZFS_VER} -k {kver}", shell=True)
                   if res_build.returncode != 0:
@@ -133,7 +144,7 @@ jobs:
                       subprocess.run(f"apt-get purge -y linux-headers-6.1.0-{num}* >/dev/null 2>&1 || true", shell=True)
                       continue
 
-                  # 模块查找与打包
+                  # 模块提取与打包
                   mod_dir = subprocess.getoutput(f'find /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver} -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname')
                   if not mod_dir or not os.path.exists(mod_dir):
                       print(f"[-] 未找到编译出的驱动模块")
@@ -150,7 +161,7 @@ jobs:
                   subprocess.run(f'tar -czf "output/zfs-modules-{kver}.tar.gz" -C "/tmp/zfs-pack-{kver}" "zfs-modules-{kver}"', shell=True)
                   print(f"✓ 成功打包: output/zfs-modules-{kver}.tar.gz")
 
-                  # 清理
+                  # 清理已编译残留，释放磁盘空间
                   subprocess.run(f"apt-get purge -y linux-headers-6.1.0-{num}* >/dev/null 2>&1 || true", shell=True)
                   subprocess.run(f"rm -rf /tmp/zfs-pack-{kver} /tmp/*.deb /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
           EOF
