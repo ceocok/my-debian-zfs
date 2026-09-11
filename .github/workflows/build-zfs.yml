@@ -1,0 +1,75 @@
+name: Build All Debian ZFS Modules
+
+on:
+  # 1. 支持在 GitHub 网页上随时一键手动点击运行
+  workflow_dispatch:
+    inputs:
+      target_kernel:
+        description: '指定编译的内核版本（留空则编译源内所有内核）'
+        required: false
+        default: ''
+  # 2. 定时任务：每周一凌晨 2 点自动检查并编译官方更新的新内核
+  schedule:
+    - cron: '0 2 * * 1'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm # 使用 Debian 12 官方容器作为构建环境
+      options: --privileged
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Debian 软件源（包含 contrib）
+        run: |
+          apt-get update
+          apt-get install -y software-properties-common curl ca-certificates
+          # 开启 contrib 源以支持 zfs-dkms
+          sed -i -E 's/(Components:.*)/\1 contrib/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+          sed -i -E 's/(deb.*main)/\1 contrib/' /etc/apt/sources.list 2>/dev/null || true
+          apt-get update
+
+      - name: 安装基础编译环境与 ZFS-DKMS
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential dkms zfs-dkms git tar gzip gawk bc
+
+      - name: 下载/获取构建工具
+        run: |
+          if [ ! -f "zfs-builder.sh" ]; then
+            curl -fsSL https://raw.githubusercontent.com/0xdabiaoge/Incudal-Debian-ZFS/main/zfs-builder.sh -o zfs-builder.sh
+            chmod +x zfs-builder.sh
+          fi
+
+      - name: 执行内核模块编译与打包
+        id: compile
+        run: |
+          mkdir -p output
+          
+          # 判断是编译指定版本还是源内所有内核
+          if [ -n "${{ github.event.inputs.target_kernel }}" ]; then
+            echo "====> 正在编译指定内核版本: ${{ github.event.inputs.target_kernel }} <===="
+            bash zfs-builder.sh --kernel "${{ github.event.inputs.target_kernel }}"
+          else
+            echo "====> 正在批量编译 Debian 源内所有可用内核版本 <===="
+            bash zfs-builder.sh --all
+          fi
+
+          echo "编译完成，生成文件列表："
+          ls -lh output/
+
+      - name: 上传编译好的模块到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: debian-ZFS
+          name: "Debian ZFS Prebuilt Modules"
+          body: |
+            自动编译的 Debian ZFS 内核预编译模块包。
+            包含各版本 Debian 标准内核及 cloud 内核模块。
+          files: output/zfs-modules-*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
