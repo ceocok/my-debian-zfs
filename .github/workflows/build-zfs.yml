@@ -1,49 +1,12 @@
-name: Build All Debian ZFS Modules
-
-on:
-  workflow_dispatch:
-    inputs:
-      target_kernel:
-        description: '指定内核版本（例如 6.1.0-47-cloud-amd64，留空则编译源内全部）'
-        required: false
-        default: ''
-  schedule:
-    - cron: '0 2 * * 1'
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    container:
-      image: debian:bookworm
-      options: --privileged
-    # 关键：强制整个构建环境使用标准的 bash 执行脚本，避免退回 dash
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 配置 Debian 软件源与安装编译依赖
-        run: |
-          apt-get update
-          apt-get install -y curl ca-certificates sed gawk tar gzip
-          
-          # 开启 contrib 和 non-free 软件源以支持 zfs-dkms
-          sed -i -E 's/(Components:.*)/\1 contrib non-free/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-          sed -i -E 's/(deb.*main)/\1 contrib non-free/' /etc/apt/sources.list 2>/dev/null || true
-          
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms zfs-dkms git bash
-
       - name: 执行全自动编译与打包
         run: |
           set -e
           mkdir -p output
           
-          # 1. 自动获取 ZFS DKMS 源码版本号
+          # 1. 临时屏蔽 apt 自动运行 dkms 的 postinst 钩子，防止 apt 安装时直接编译崩溃
+          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
+
+          # 2. 获取 ZFS DKMS 版本号
           ZFS_VER=$(ls -d /usr/src/zfs-* 2>/dev/null | head -n1 | sed 's|.*/zfs-||')
           if [ -z "$ZFS_VER" ]; then
             echo "错误: 未能获取到 ZFS DKMS 版本号"
@@ -51,13 +14,14 @@ jobs:
           fi
           echo "====> 检测到 ZFS DKMS 源码版本: ${ZFS_VER} <===="
 
-          # 2. 确定要编译的内核版本列表
+          # 3. 筛选要编译的内核版本
           KERNELS=()
           if [ -n "${{ github.event.inputs.target_kernel }}" ]; then
             KERNELS=("${{ github.event.inputs.target_kernel }}")
           else
-            echo "====> 正在扫描 Debian 官方源中的所有可用内核版本... <===="
-            for kver in $(apt-cache search '^linux-headers-6\.[0-9]' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9].*amd64$' | sort -uV); do
+            echo "====> 正在扫描 Debian 官方源中的所有可用 6.1 内核版本... <===="
+            # 排除 -rt 内核（ZFS 2.1不支持）以及 6.12+ 内核，只取 6.1.0-xx-amd64 和 cloud-amd64
+            for kver in $(apt-cache --names-only search '^linux-headers-6\.1\.0-[0-9]+-(amd64|cloud-amd64)$' | awk '{print $1}' | sed 's/^linux-headers-//' | sort -uV); do
               [ -n "$kver" ] && KERNELS+=("$kver")
             done
           fi
@@ -65,7 +29,7 @@ jobs:
           echo "待编译内核列表（共 ${#KERNELS[@]} 个）:"
           printf '  - %s\n' "${KERNELS[@]}"
 
-          # 3. 循环非交互编译每个内核
+          # 4. 循环编译每个内核
           for kver in "${KERNELS[@]}"; do
             echo ""
             echo "============================================================"
@@ -74,11 +38,14 @@ jobs:
             
             # 安装对应内核头文件
             if ! apt-get install -y --no-install-recommends "linux-headers-${kver}"; then
-              echo "警告: 安装 linux-headers-${kver} 失败，跳过该版本"
+              echo "警告: 安装 linux-headers-${kver} 失败，正在回滚清理..."
+              dpkg --configure -a || true
+              apt-get -f install -y || true
+              apt-get purge -y "linux-headers-${kver}" || true
               continue
             fi
 
-            # 编译 DKMS 模块
+            # 执行 DKMS 编译
             dkms remove "zfs/${ZFS_VER}" -k "${kver}" 2>/dev/null || true
             if ! dkms build "zfs/${ZFS_VER}" -k "${kver}"; then
               echo "错误: DKMS 编译 ${kver} 失败"
@@ -86,21 +53,21 @@ jobs:
               continue
             fi
 
-            # 查找编译生成的 .ko 文件
+            # 查找生成的 .ko 模块
             MOD_DIR=$(find "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname)
             if [ -z "$MOD_DIR" ]; then
               echo "错误: 未能找到生成的内核驱动模块"
+              apt-get purge -y "linux-headers-${kver}" || true
               continue
             fi
 
-            # 打包成符合 Incudal 规范的预编译压缩包
+            # 打包
             PKG_DIR="/tmp/zfs-pack-${kver}/zfs-modules-${kver}"
             rm -rf "/tmp/zfs-pack-${kver}"
             mkdir -p "${PKG_DIR}/modules"
 
             find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
             
-            # 写入元数据 metadata.txt
             echo "kernel_version=${kver}" > "${PKG_DIR}/metadata.txt"
             echo "module_path=updates/dkms" >> "${PKG_DIR}/metadata.txt"
             echo "zfs_version=${ZFS_VER}" >> "${PKG_DIR}/metadata.txt"
@@ -109,25 +76,11 @@ jobs:
             tar -czf "output/zfs-modules-${kver}.tar.gz" -C "/tmp/zfs-pack-${kver}" "zfs-modules-${kver}"
             echo "✓ 成功打包: output/zfs-modules-${kver}.tar.gz"
 
-            # 清理已编译内核的头文件，释放 Actions 磁盘空间
+            # 清理头文件和临时目录，释放磁盘空间
             apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-            apt-get autoremove -y >/dev/null 2>&1 || true
             rm -rf "/tmp/zfs-pack-${kver}"
           done
 
           echo ""
           echo "====> 全部编译完成，生成的文件列表: <===="
           ls -lh output/
-
-      - name: 上传预编译包到 GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
-          body: |
-            自动编译的 Debian ZFS 内核预编译模块包。
-            包含 Debian 12 (Bookworm) 所有主流版本及 cloud-amd64 内核模块。
-          files: output/zfs-modules-*.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
