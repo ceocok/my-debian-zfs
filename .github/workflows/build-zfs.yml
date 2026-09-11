@@ -28,12 +28,12 @@ jobs:
       - name: 配置编译基础环境与 ZFS 驱动
         run: |
           set -e
-          cat << 'EOF' > /etc/apt/sources.list
+          cat << 'ENDCAT' > /etc/apt/sources.list
           deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
           deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
-          EOF
+          ENDCAT
           rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
           apt-get update
@@ -51,8 +51,8 @@ jobs:
           set -e
           mkdir -p output
 
-          python3 - << 'EOF'
-          import os, sys, re, glob, urllib.request, subprocess
+          python3 - << 'PYEOF'
+          import os, sys, re, time, glob, urllib.request, subprocess
 
           REPO = os.environ.get("GITHUB_REPOSITORY", "")
 
@@ -72,8 +72,27 @@ jobs:
               res = subprocess.run(["curl", "-sSfL", "-I", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               return res.returncode == 0
 
-          # 3. 从 snapshot.debian.org 解析并安装 deb
-          def install_snapshot_headers(kver):
+          # 3. 安全下载 deb（关键：强制使用 HTTP/1.1，避免 snapshot 站点的 HTTP/2 协议 92 错误）
+          def download_snapshot_deb(url, target_path):
+              if os.path.exists(target_path):
+                  try:
+                      os.remove(target_path)
+                  except Exception:
+                      pass
+              cmd = [
+                  "curl", "--http1.1", "-sSL",
+                  "--retry", "5", "--retry-delay", "3",
+                  "--max-time", "180",
+                  "-A", "Mozilla/5.0 (X11; Linux x86_64)",
+                  url, "-o", target_path
+              ]
+              res = subprocess.run(cmd)
+              if res.returncode == 0 and os.path.exists(target_path) and os.path.getsize(target_path) > 1024:
+                  return True
+              return False
+
+          # 4. 从 snapshot.debian.org 解析并安装 deb
+          def install_snapshot_headers(kver, base_ver):
               pkg_url = f"https://snapshot.debian.org/binary/linux-headers-{kver}/"
               req = urllib.request.Request(pkg_url, headers={"User-Agent": "Mozilla/5.0"})
               try:
@@ -89,12 +108,7 @@ jobs:
                   return False
               src_ver = m.group(1)
 
-              m_base = re.match(r'^(6\.1\.0-\d+)', kver)
-              if not m_base:
-                  return False
-              base_ver = m_base.group(1)
               common_pkg = f"linux-headers-{base_ver}-common"
-
               src_url = f"https://snapshot.debian.org/package/linux/{src_ver}/"
               req_src = urllib.request.Request(src_url, headers={"User-Agent": "Mozilla/5.0"})
               try:
@@ -115,17 +129,28 @@ jobs:
               arch_url = "https://snapshot.debian.org" + arch_match.group(1)
 
               print(f"[+] 正在从快照库拉取: {common_pkg} & linux-headers-{kver}...")
-              subprocess.run(["curl", "-sSL", "--retry", "3", common_url, "-o", "/tmp/common.deb"], check=True)
-              subprocess.run(["curl", "-sSL", "--retry", "3", arch_url, "-o", "/tmp/arch.deb"], check=True)
+              if not download_snapshot_deb(common_url, "/tmp/common.deb"):
+                  print(f"[-] 下载 common 包失败: {kver}")
+                  return False
+              if not download_snapshot_deb(arch_url, "/tmp/arch.deb"):
+                  print(f"[-] 下载 arch 包失败: {kver}")
+                  return False
 
               # 使用 apt-get install 统一安全安装本地 deb
               res = subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", "/tmp/common.deb", "/tmp/arch.deb"])
-              return res.returncode == 0
+              if res.returncode != 0:
+                  print(f"[-] 安装 deb 失败: {kver}")
+                  subprocess.run("dpkg --configure -a || true", shell=True)
+                  subprocess.run("apt-get -f install -y || true", shell=True)
+                  subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
+                  return False
+              return True
 
-          # 4. 遍历编译 26 到 46
+          # 5. 遍历编译 26 到 46
           for num in range(26, 47):
+              base_ver = f"6.1.0-{num}"
               for flavor in ["amd64", "cloud-amd64"]:
-                  kver = f"6.1.0-{num}-{flavor}"
+                  kver = f"{base_ver}-{flavor}"
                   print(f"\n============================================================")
                   print(f">>> 正在检查: {kver}")
 
@@ -133,7 +158,8 @@ jobs:
                       print(f"✓ 已在 Release 中存在，跳过编译")
                       continue
 
-                  if not install_snapshot_headers(kver):
+                  if not install_snapshot_headers(kver, base_ver):
+                      print(f"[-] 获取头文件失败，跳过: {kver}")
                       continue
 
                   print(f"[+] 开始 DKMS 编译: {kver} (ZFS: {ZFS_VER})...")
@@ -141,14 +167,20 @@ jobs:
                   res_build = subprocess.run(f"dkms build zfs/{ZFS_VER} -k {kver}", shell=True)
                   if res_build.returncode != 0:
                       print(f"[-] 编译 {kver} 失败，清理并跳过")
-                      subprocess.run(f"apt-get purge -y linux-headers-6.1.0-{num}* >/dev/null 2>&1 || true", shell=True)
+                      log_path = f"/var/lib/dkms/zfs/{ZFS_VER}/build/make.log"
+                      if os.path.exists(log_path):
+                          with open(log_path, "r", errors="ignore") as lf:
+                              print("----- make.log (last 20 lines) -----")
+                              print("".join(lf.readlines()[-20:]))
+                      subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
+                      subprocess.run(f"rm -rf /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
                       continue
 
                   # 模块提取与打包
                   mod_dir = subprocess.getoutput(f'find /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver} -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname')
                   if not mod_dir or not os.path.exists(mod_dir):
                       print(f"[-] 未找到编译出的驱动模块")
-                      subprocess.run(f"apt-get purge -y linux-headers-6.1.0-{num}* >/dev/null 2>&1 || true", shell=True)
+                      subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
                       continue
 
                   pack_dir = f"/tmp/zfs-pack-{kver}/zfs-modules-{kver}"
@@ -162,9 +194,10 @@ jobs:
                   print(f"✓ 成功打包: output/zfs-modules-{kver}.tar.gz")
 
                   # 清理已编译残留，释放磁盘空间
-                  subprocess.run(f"apt-get purge -y linux-headers-6.1.0-{num}* >/dev/null 2>&1 || true", shell=True)
+                  subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
                   subprocess.run(f"rm -rf /tmp/zfs-pack-{kver} /tmp/*.deb /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
-          EOF
+                  time.sleep(1)
+          PYEOF
 
       - name: 上传快照内核包到 Release
         uses: softprops/action-gh-release@v2
@@ -173,6 +206,7 @@ jobs:
           tag_name: debian-ZFS
           name: "Debian ZFS Prebuilt Modules"
           files: output/zfs-modules-*.tar.gz
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -195,12 +229,12 @@ jobs:
       - name: 配置软件源与安装 OpenZFS
         run: |
           set -e
-          cat << 'EOF' > /etc/apt/sources.list
+          cat << 'ENDCAT' > /etc/apt/sources.list
           deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
           deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
-          EOF
+          ENDCAT
           rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
           apt-get update
@@ -274,6 +308,7 @@ jobs:
           tag_name: debian-ZFS
           name: "Debian ZFS Prebuilt Modules"
           files: output/zfs-modules-*.tar.gz
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -367,6 +402,7 @@ jobs:
           tag_name: debian-ZFS
           name: "Debian ZFS Prebuilt Modules"
           files: output/zfs-modules-*.tar.gz
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -460,5 +496,6 @@ jobs:
           tag_name: debian-ZFS
           name: "Debian ZFS Prebuilt Modules"
           files: output/zfs-modules-*.tar.gz
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
