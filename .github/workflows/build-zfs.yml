@@ -515,16 +515,14 @@ jobs:
       - name: 配置软件源与安装 OpenZFS
         run: |
           set -e
-          # 禁用 Valid-Until 检查以支持 Debian 11 EOL 归档安全源
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
           cat << 'ENDCAT' > /etc/apt/sources.list
           deb http://deb.debian.org/debian bullseye main contrib non-free
           deb http://deb.debian.org/debian bullseye-updates main contrib non-free
-          deb http://security.debian.org/debian-security bullseye-security main contrib non-free
           ENDCAT
           rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
-          apt-get update -o Acquire::Check-Valid-Until=false
+          apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc zfs-dkms
 
@@ -623,16 +621,14 @@ jobs:
       - name: 配置编译基础环境与 ZFS 驱动
         run: |
           set -e
-          # 禁用 Valid-Until 检查以支持 Debian 11 EOL 归档安全源
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
           cat << 'ENDCAT' > /etc/apt/sources.list
           deb http://deb.debian.org/debian bullseye main contrib non-free
           deb http://deb.debian.org/debian bullseye-updates main contrib non-free
-          deb http://security.debian.org/debian-security bullseye-security main contrib non-free
           ENDCAT
           rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
-          apt-get update -o Acquire::Check-Valid-Until=false
+          apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
             linux-kbuild-5.10 linux-compiler-gcc-10-x86 zfs-dkms
