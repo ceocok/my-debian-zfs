@@ -53,10 +53,9 @@ jobs:
             KERNELS=("${{ github.event.inputs.target_kernel }}")
           else
             echo "====> 正在扫描 Debian 官方源中的所有可用内核版本... <===="
-            # 过滤掉虚拟元包，仅提取具体小版本的 amd64/cloud-amd64 内核
-            while IFS= read -r kver; do
+            for kver in $(apt-cache search '^linux-headers-6\.[0-9]' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9].*amd64$' | sort -uV); do
               [ -n "$kver" ] && KERNELS+=("$kver")
-            done < <(apt-cache search '^linux-headers-6\.[0-9]' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9].*amd64$' | sort -uV)
+            done
           fi
 
           echo "待编译内核列表（共 ${#KERNELS[@]} 个）:"
@@ -97,18 +96,16 @@ jobs:
 
             find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
             
-            # 写入元数据 metadata.txt
-            cat <<META > "${PKG_DIR}/metadata.txt"
-kernel_version=${kver}
-module_path=updates/dkms
-zfs_version=${ZFS_VER}
-build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-META
+            # 写入元数据 metadata.txt（采用标准缩进 echo 写入）
+            echo "kernel_version=${kver}" > "${PKG_DIR}/metadata.txt"
+            echo "module_path=updates/dkms" >> "${PKG_DIR}/metadata.txt"
+            echo "zfs_version=${ZFS_VER}" >> "${PKG_DIR}/metadata.txt"
+            echo "build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "${PKG_DIR}/metadata.txt"
 
             tar -czf "output/zfs-modules-${kver}.tar.gz" -C "/tmp/zfs-pack-${kver}" "zfs-modules-${kver}"
             echo "✓ 成功打包: output/zfs-modules-${kver}.tar.gz"
 
-            # 关键：清理已编译内核的头文件，防止 GitHub Actions 磁盘爆满
+            # 清理已编译内核的头文件，释放 Actions 磁盘空间
             apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
             apt-get autoremove -y >/dev/null 2>&1 || true
             rm -rf "/tmp/zfs-pack-${kver}"
