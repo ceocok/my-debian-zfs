@@ -2,803 +2,677 @@ name: Build Debian ZFS Prebuilt Modules
 
 on:
   workflow_dispatch:
+    inputs:
+      backfill_history:
+        description: '同时从 snapshot.debian.org 回填 Debian 12+ 历史内核'
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: '0 2 * * 1'
 
 permissions:
   contents: write
 
+# 说明：
+# 1. 仅覆盖 Debian 官方 x86_64 内核：amd64 / cloud-amd64 / rt-amd64。
+# 2. 不包含 Proxmox VE 的 *-pve 内核；PVE 应单独建立 workflow。
+# 3. 每周任务扫描 Debian 12 / 13 / 14 当前仓库（含 backports）。
+# 4. 手动运行时勾选 backfill_history，可从 snapshot.debian.org 回填已从 APT 索引淘汰的历史内核。
+
 jobs:
   # ============================================================================
-  # Job 1: Debian 12 历史快照内核 (6.1.0-26 ~ 6.1.0-60，补齐 48/49/51 及后续)
+  # Job 1: 当前仓库全量扫描
   # ============================================================================
-  debian12-snapshot:
-    name: "Debian 12 历史快照 (6.1.0-26 ~ 60)"
-    runs-on: ubuntu-latest
-    container:
-      image: debian:bookworm
-      options: --privileged
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 配置编译基础环境与 ZFS 驱动
-        run: |
-          set -e
-          cat << 'ENDCAT' > /etc/apt/sources.list
-          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
-          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
-          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
-          deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
-          ENDCAT
-          rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
-            linux-kbuild-6.1 linux-compiler-gcc-12-x86
-
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            -t bookworm-backports zfs-dkms
-
-          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 从 Snapshot 下载并编译历史内核
-        run: |
-          set -e
-          mkdir -p output
-
-          python3 - << 'PYEOF'
-          import os, sys, re, time, glob, urllib.request, subprocess
-
-          REPO = os.environ.get("GITHUB_REPOSITORY", "")
-
-          # 1. 自动定位 ZFS DKMS 源码版本号
-          zfs_dirs = glob.glob("/usr/src/zfs-*")
-          if not zfs_dirs:
-              print("[-] 错误: 未在 /usr/src/ 中找到 zfs 源码目录")
-              sys.exit(1)
-          ZFS_VER = os.path.basename(zfs_dirs[0]).replace("zfs-", "")
-          print(f"====> 检测到 ZFS DKMS 版本: {ZFS_VER} <====")
-
-          # 2. 探测包在 Release 中是否已存在（已存在则秒跳过）
-          def is_already_released(kver):
-              if not REPO:
-                  return False
-              url = f"https://github.com/{REPO}/releases/download/debian-ZFS/zfs-modules-{kver}.tar.gz"
-              res = subprocess.run(["curl", "-sSfL", "-I", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              return res.returncode == 0
-
-          # 3. 安全下载 deb（强制使用 HTTP/1.1 避免 snapshot 站点的 HTTP/2 协议 92 错误）
-          def download_snapshot_deb(url, target_path):
-              if os.path.exists(target_path):
-                  try:
-                      os.remove(target_path)
-                  except Exception:
-                      pass
-              cmd = [
-                  "curl", "--http1.1", "-sSL",
-                  "--retry", "5", "--retry-delay", "3",
-                  "--max-time", "180",
-                  "-A", "Mozilla/5.0 (X11; Linux x86_64)",
-                  url, "-o", target_path
-              ]
-              res = subprocess.run(cmd)
-              if res.returncode == 0 and os.path.exists(target_path) and os.path.getsize(target_path) > 1024:
-                  return True
-              return False
-
-          # 4. 从 snapshot.debian.org 解析并安装 deb
-          def install_snapshot_headers(kver, base_ver):
-              pkg_url = f"https://snapshot.debian.org/binary/linux-headers-{kver}/"
-              req = urllib.request.Request(pkg_url, headers={"User-Agent": "Mozilla/5.0"})
-              try:
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-                      html = resp.read().decode("utf-8", errors="ignore")
-              except Exception as e:
-                  print(f"[-] 快照库未收录: {kver} ({e})")
-                  return False
-
-              m = re.search(r'href="(?:\.\./\.\./)?package/linux/([^/#"]+)/', html)
-              if not m:
-                  print(f"[-] 未定位到源码包版本: {kver}")
-                  return False
-              src_ver = m.group(1)
-
-              common_pkg = f"linux-headers-{base_ver}-common"
-              src_url = f"https://snapshot.debian.org/package/linux/{src_ver}/"
-              req_src = urllib.request.Request(src_url, headers={"User-Agent": "Mozilla/5.0"})
-              try:
-                  with urllib.request.urlopen(req_src, timeout=20) as resp:
-                      src_html = resp.read().decode("utf-8", errors="ignore")
-              except Exception as e:
-                  print(f"[-] 无法读取版本详情页: {src_url} ({e})")
-                  return False
-
-              common_match = re.search(r'href="([^"]*/' + re.escape(common_pkg) + r'_[^"]*_all\.deb)"', src_html)
-              arch_match = re.search(r'href="([^"]*/linux-headers-' + re.escape(kver) + r'_[^"]*_amd64\.deb)"', src_html)
-
-              if not common_match or not arch_match:
-                  print(f"[-] 未能在版本页提取到 .deb 链接: {kver}")
-                  return False
-
-              common_url = "https://snapshot.debian.org" + common_match.group(1)
-              arch_url = "https://snapshot.debian.org" + arch_match.group(1)
-
-              print(f"[+] 正在从快照库拉取: {common_pkg} & linux-headers-{kver}...")
-              if not download_snapshot_deb(common_url, "/tmp/common.deb"):
-                  print(f"[-] 下载 common 包失败: {kver}")
-                  return False
-              if not download_snapshot_deb(arch_url, "/tmp/arch.deb"):
-                  print(f"[-] 下载 arch 包失败: {kver}")
-                  return False
-
-              res = subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", "/tmp/common.deb", "/tmp/arch.deb"])
-              if res.returncode != 0:
-                  print(f"[-] 安装 deb 失败: {kver}")
-                  subprocess.run("dpkg --configure -a || true", shell=True)
-                  subprocess.run("apt-get -f install -y || true", shell=True)
-                  subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                  return False
-              return True
-
-          # 5. 遍历编译 26 到 59（包含 48、49、51，并自动涵盖未来 54~59）
-          for num in range(26, 60):
-              base_ver = f"6.1.0-{num}"
-              for flavor in ["amd64", "cloud-amd64"]:
-                  kver = f"{base_ver}-{flavor}"
-                  print(f"\n============================================================")
-                  print(f">>> 正在检查: {kver}")
-
-                  if is_already_released(kver):
-                      print(f"✓ 已在 Release 中存在，跳过编译")
-                      continue
-
-                  if not install_snapshot_headers(kver, base_ver):
-                      continue
-
-                  print(f"[+] 开始 DKMS 编译: {kver} (ZFS: {ZFS_VER})...")
-                  subprocess.run(f"dkms remove zfs/{ZFS_VER} -k {kver} 2>/dev/null || true", shell=True)
-                  res_build = subprocess.run(f"dkms build zfs/{ZFS_VER} -k {kver}", shell=True)
-                  if res_build.returncode != 0:
-                      print(f"[-] 编译 {kver} 失败，清理并跳过")
-                      log_path = f"/var/lib/dkms/zfs/{ZFS_VER}/build/make.log"
-                      if os.path.exists(log_path):
-                          with open(log_path, "r", errors="ignore") as lf:
-                              print("----- make.log (last 20 lines) -----")
-                              print("".join(lf.readlines()[-20:]))
-                      subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                      subprocess.run(f"rm -rf /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
-                      continue
-
-                  mod_dir = subprocess.getoutput(f'find /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver} -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname')
-                  if not mod_dir or not os.path.exists(mod_dir):
-                      print(f"[-] 未找到编译出的驱动模块")
-                      subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                      continue
-
-                  pack_dir = f"/tmp/zfs-pack-{kver}/zfs-modules-{kver}"
-                  os.makedirs(f"{pack_dir}/modules", exist_ok=True)
-                  subprocess.run(f'find "{mod_dir}" -name "*.ko*" -type f -exec cp {{}} "{pack_dir}/modules/" \\;', shell=True)
-
-                  with open(f"{pack_dir}/metadata.txt", "w") as f:
-                      f.write(f"kernel_version={kver}\nmodule_path=updates/dkms\nzfs_version={ZFS_VER}\n")
-
-                  subprocess.run(f'tar -czf "output/zfs-modules-{kver}.tar.gz" -C "/tmp/zfs-pack-{kver}" "zfs-modules-{kver}"', shell=True)
-                  print(f"✓ 成功打包: output/zfs-modules-{kver}.tar.gz")
-
-                  subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                  subprocess.run(f"rm -rf /tmp/zfs-pack-{kver} /tmp/*.deb /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
-                  time.sleep(1)
-          PYEOF
-
-      - name: 上传快照内核包到 Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
-          files: output/zfs-modules-*.tar.gz
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ============================================================================
-  # Job 2: Debian 12 当前及最新内核 (6.1.0-47 ~ 6.1.0-53 + 6.12 Backports)
-  # ============================================================================
-  debian12-current:
-    name: "Debian 12 当前与最新 (6.1.0-47+ 及 6.12+)"
-    runs-on: ubuntu-latest
-    container:
-      image: debian:bookworm
-      options: --privileged
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 配置软件源与安装 OpenZFS
-        run: |
-          set -e
-          cat << 'ENDCAT' > /etc/apt/sources.list
-          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
-          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
-          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
-          deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
-          ENDCAT
-          rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            -t bookworm-backports zfs-dkms
-
-          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 批量编译与打包
-        run: |
-          set -e
-          mkdir -p output
-          ZFS_VER=$(ls -d /usr/src/zfs-* 2>/dev/null | head -n1 | sed 's|.*/zfs-||')
-          echo "====> 检测到 ZFS DKMS 版本: ${ZFS_VER} <===="
-
-          KERNELS=()
-          for kver in $(apt-cache --names-only search '^linux-headers-6\.' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9]+\.[0-9]+.*-(amd64|cloud-amd64)$' | grep -v -- '-rt-' | grep -v -E '^6\.[0-9]+-(amd64|cloud-amd64)$' | sort -uV); do
-            [ -n "$kver" ] && KERNELS+=("$kver")
-          done
-
-          for kver in "${KERNELS[@]}"; do
-            echo -e "\n============================================================"
-            echo ">>> 正在检查: ${kver}"
-
-            if curl -sSfL -I "https://github.com/${{ github.repository }}/releases/download/debian-ZFS/zfs-modules-${kver}.tar.gz" >/dev/null 2>&1; then
-              echo "✓ 已在 Release 中存在，跳过编译"
-              continue
-            fi
-
-            if ! apt-get install -y --no-install-recommends -t bookworm-backports "linux-headers-${kver}" 2>/dev/null && \
-               ! apt-get install -y --no-install-recommends "linux-headers-${kver}"; then
-              echo "警告: 安装 linux-headers-${kver} 失败，跳过"
-              dpkg --configure -a || true
-              apt-get -f install -y || true
-              apt-get purge -y "linux-headers-${kver}" || true
-              continue
-            fi
-
-            dkms remove "zfs/${ZFS_VER}" -k "${kver}" 2>/dev/null || true
-            if ! dkms build "zfs/${ZFS_VER}" -k "${kver}"; then
-              echo "错误: 编译 ${kver} 失败"
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            MOD_DIR=$(find "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname)
-            if [ -z "$MOD_DIR" ]; then
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            PKG_DIR="/tmp/zfs-pack-${kver}/zfs-modules-${kver}"
-            rm -rf "/tmp/zfs-pack-${kver}"
-            mkdir -p "${PKG_DIR}/modules"
-            find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
-            echo -e "kernel_version=${kver}\nmodule_path=updates/dkms\nzfs_version=${ZFS_VER}" > "${PKG_DIR}/metadata.txt"
-
-            tar -czf "output/zfs-modules-${kver}.tar.gz" -C "/tmp/zfs-pack-${kver}" "zfs-modules-${kver}"
-            echo "✓ 成功打包: output/zfs-modules-${kver}.tar.gz"
-
-            apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-            rm -rf "/tmp/zfs-pack-${kver}" "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}"
-          done
-
-      - name: 上传当前内核包到 Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
-          files: output/zfs-modules-*.tar.gz
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ============================================================================
-  # Job 3: Debian 13 (Trixie) 全系列内核
-  # ============================================================================
-  debian13-trixie:
-    name: "Debian 13 Trixie (6.12+ 系列)"
-    runs-on: ubuntu-latest
-    container:
-      image: debian:trixie
-      options: --privileged
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 配置软件源与安装 OpenZFS
-        run: |
-          set -e
-          sed -i -E 's/(Components:.*)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-          sed -i -E 's/(deb.*main)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list 2>/dev/null || true
-
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms zfs-dkms git bash curl ca-certificates tar gzip sed gawk bc
-
-          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 批量编译与打包
-        run: |
-          set -e
-          mkdir -p output
-          ZFS_VER=$(ls -d /usr/src/zfs-* 2>/dev/null | head -n1 | sed 's|.*/zfs-||')
-          echo "====> 检测到 ZFS DKMS 版本: ${ZFS_VER} <===="
-
-          KERNELS=()
-          for kver in $(apt-cache --names-only search '^linux-headers-[0-9]' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9]+\.[0-9]+.*-(amd64|cloud-amd64)$' | grep -v -- '-rt-' | grep -v -E '^[0-9]+\.[0-9]+-(amd64|cloud-amd64)$' | sort -uV); do
-            [ -n "$kver" ] && KERNELS+=("$kver")
-          done
-
-          for kver in "${KERNELS[@]}"; do
-            echo -e "\n============================================================"
-            echo ">>> 正在检查: ${kver}"
-
-            if curl -sSfL -I "https://github.com/${{ github.repository }}/releases/download/debian-ZFS/zfs-modules-${kver}.tar.gz" >/dev/null 2>&1; then
-              echo "✓ 已在 Release 中存在，跳过编译"
-              continue
-            fi
-
-            if ! apt-get install -y --no-install-recommends "linux-headers-${kver}"; then
-              echo "警告: 安装 linux-headers-${kver} 失败，跳过"
-              dpkg --configure -a || true
-              apt-get -f install -y || true
-              apt-get purge -y "linux-headers-${kver}" || true
-              continue
-            fi
-
-            dkms remove "zfs/${ZFS_VER}" -k "${kver}" 2>/dev/null || true
-            if ! dkms build "zfs/${ZFS_VER}" -k "${kver}"; then
-              echo "错误: 编译 ${kver} 失败"
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            MOD_DIR=$(find "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname)
-            if [ -z "$MOD_DIR" ]; then
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            PKG_DIR="/tmp/zfs-pack-${kver}/zfs-modules-${kver}"
-            rm -rf "/tmp/zfs-pack-${kver}"
-            mkdir -p "${PKG_DIR}/modules"
-            find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
-            echo -e "kernel_version=${kver}\nmodule_path=updates/dkms\nzfs_version=${ZFS_VER}" > "${PKG_DIR}/metadata.txt"
-
-            tar -czf "output/zfs-modules-${kver}.tar.gz" -C "/tmp/zfs-pack-${kver}" "zfs-modules-${kver}"
-            echo "✓ 成功打包: output/zfs-modules-${kver}.tar.gz"
-
-            apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-            rm -rf "/tmp/zfs-pack-${kver}" "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}"
-          done
-
-      - name: 上传 Debian 13 包到 Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
-          files: output/zfs-modules-*.tar.gz
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ============================================================================
-  # Job 4: Debian 14 (Forky) 全系列内核
-  # ============================================================================
-  debian14-forky:
-    name: "Debian 14 Forky (最新测试主线)"
-    runs-on: ubuntu-latest
-    container:
-      image: debian:forky
-      options: --privileged
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 配置软件源与安装 OpenZFS
-        run: |
-          set -e
-          sed -i -E 's/(Components:.*)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-          sed -i -E 's/(deb.*main)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list 2>/dev/null || true
-
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms zfs-dkms git bash curl ca-certificates tar gzip sed gawk bc
-
-          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 批量编译与打包
-        run: |
-          set -e
-          mkdir -p output
-          ZFS_VER=$(ls -d /usr/src/zfs-* 2>/dev/null | head -n1 | sed 's|.*/zfs-||')
-          echo "====> 检测到 ZFS DKMS 版本: ${ZFS_VER} <===="
-
-          KERNELS=()
-          for kver in $(apt-cache --names-only search '^linux-headers-[0-9]' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9]+\.[0-9]+.*-(amd64|cloud-amd64)$' | grep -v -- '-rt-' | grep -v -E '^[0-9]+\.[0-9]+-(amd64|cloud-amd64)$' | sort -uV); do
-            [ -n "$kver" ] && KERNELS+=("$kver")
-          done
-
-          for kver in "${KERNELS[@]}"; do
-            echo -e "\n============================================================"
-            echo ">>> 正在检查: ${kver}"
-
-            if curl -sSfL -I "https://github.com/${{ github.repository }}/releases/download/debian-ZFS/zfs-modules-${kver}.tar.gz" >/dev/null 2>&1; then
-              echo "✓ 已在 Release 中存在，跳过编译"
-              continue
-            fi
-
-            if ! apt-get install -y --no-install-recommends "linux-headers-${kver}"; then
-              echo "警告: 安装 linux-headers-${kver} 失败，跳过"
-              dpkg --configure -a || true
-              apt-get -f install -y || true
-              apt-get purge -y "linux-headers-${kver}" || true
-              continue
-            fi
-
-            dkms remove "zfs/${ZFS_VER}" -k "${kver}" 2>/dev/null || true
-            if ! dkms build "zfs/${ZFS_VER}" -k "${kver}"; then
-              echo "错误: 编译 ${kver} 失败"
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            MOD_DIR=$(find "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname)
-            if [ -z "$MOD_DIR" ]; then
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            PKG_DIR="/tmp/zfs-pack-${kver}/zfs-modules-${kver}"
-            rm -rf "/tmp/zfs-pack-${kver}"
-            mkdir -p "${PKG_DIR}/modules"
-            find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
-            echo -e "kernel_version=${kver}\nmodule_path=updates/dkms\nzfs_version=${ZFS_VER}" > "${PKG_DIR}/metadata.txt"
-
-            tar -czf "output/zfs-modules-${kver}.tar.gz" -C "/tmp/zfs-pack-${kver}" "zfs-modules-${kver}"
-            echo "✓ 成功打包: output/zfs-modules-${kver}.tar.gz"
-
-            apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-            rm -rf "/tmp/zfs-pack-${kver}" "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}"
-          done
-
-      - name: 上传 Debian 14 包到 Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
-          files: output/zfs-modules-*.tar.gz
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ============================================================================
-  # Job 5: Debian 11 (Bullseye) 当前官方源内核 (5.10.0-30+ 等)
-  # ============================================================================
-  debian11-current:
-    name: "Debian 11 当前内核 (5.10.0 系列)"
-    runs-on: ubuntu-latest
-    container:
-      image: debian:bullseye
-      options: --privileged
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 配置软件源与安装 OpenZFS
-        run: |
-          set -e
-          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
-          cat << 'ENDCAT' > /etc/apt/sources.list
-          deb http://deb.debian.org/debian bullseye main contrib non-free
-          deb http://deb.debian.org/debian bullseye-updates main contrib non-free
-          ENDCAT
-          rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
-            libc6=2.31-13+deb11u11 libc-bin=2.31-13+deb11u11 perl-base=5.32.1-4+deb11u3
-
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
-            linux-kbuild-5.10 linux-compiler-gcc-10-x86 zfs-dkms
-
-          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 批量编译与打包
-        run: |
-          set -e
-          mkdir -p output
-          ZFS_VER=$(ls -d /usr/src/zfs-* 2>/dev/null | head -n1 | sed 's|.*/zfs-||')
-          echo "====> 检测到 ZFS DKMS 版本: ${ZFS_VER} <===="
-
-          KERNELS=()
-          for kver in $(apt-cache --names-only search '^linux-headers-5\.10\.0' | awk '{print $1}' | sed 's/^linux-headers-//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-(amd64|cloud-amd64)$' | grep -v -- '-rt-' | sort -uV); do
-            [ -n "$kver" ] && KERNELS+=("$kver")
-          done
-
-          for kver in "${KERNELS[@]}"; do
-            echo -e "\n============================================================"
-            echo ">>> 正在检查: ${kver}"
-
-            if curl -sSfL -I "https://github.com/${{ github.repository }}/releases/download/debian-ZFS/zfs-modules-${kver}.tar.gz" >/dev/null 2>&1; then
-              echo "✓ 已在 Release 中存在，跳过编译"
-              continue
-            fi
-
-            if ! apt-get install -y --no-install-recommends "linux-headers-${kver}"; then
-              echo "警告: 安装 linux-headers-${kver} 失败，跳过"
-              dpkg --configure -a || true
-              apt-get -f install -y || true
-              apt-get purge -y "linux-headers-${kver}" || true
-              continue
-            fi
-
-            dkms remove "zfs/${ZFS_VER}" -k "${kver}" 2>/dev/null || true
-            if ! dkms build "zfs/${ZFS_VER}" -k "${kver}"; then
-              echo "错误: 编译 ${kver} 失败"
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            MOD_DIR=$(find "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname)
-            if [ -z "$MOD_DIR" ]; then
-              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-              continue
-            fi
-
-            PKG_DIR="/tmp/zfs-pack-${kver}/zfs-modules-${kver}"
-            rm -rf "/tmp/zfs-pack-${kver}"
-            mkdir -p "${PKG_DIR}/modules"
-            find "$MOD_DIR" -name "*.ko*" -type f -exec cp {} "${PKG_DIR}/modules/" \;
-            echo -e "kernel_version=${kver}\nmodule_path=updates/dkms\nzfs_version=${ZFS_VER}" > "${PKG_DIR}/metadata.txt"
-
-            tar -czf "output/zfs-modules-${kver}.tar.gz" -C "/tmp/zfs-pack-${kver}" "zfs-modules-${kver}"
-            echo "✓ 成功打包: output/zfs-modules-${kver}.tar.gz"
-
-            apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
-            rm -rf "/tmp/zfs-pack-${kver}" "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}"
-          done
-
-      - name: 上传 Debian 11 当前内核包到 Release
-        uses: softprops/action-gh-release@v2
-        if: success()
-        with:
-          tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
-          files: output/zfs-modules-*.tar.gz
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ============================================================================
-  # Job 6: Debian 11 (Bullseye) 历史快照内核 (5.10.0-1 ~ 5.10.0-46 双机并行)
-  # ============================================================================
-  debian11-snapshot:
-    name: "Debian 11 历史快照 (5.10.0-${{ matrix.start }} ~ ${{ matrix.end }})"
+  current-debian:
+    name: "Debian ${{ matrix.debian }} current/all flavors"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - start: 1
-            end: 25
-          - start: 26
-            end: 47
+          - debian: '12'
+            image: bookworm
+            suite: bookworm
+            backports: bookworm-backports
+          - debian: '13'
+            image: trixie
+            suite: trixie
+            backports: trixie-backports
+          - debian: '14'
+            image: forky
+            suite: forky
+            backports: ''
+
     container:
-      image: debian:bullseye
+      image: debian:${{ matrix.image }}
       options: --privileged
+
     defaults:
       run:
         shell: bash
+
     steps:
-      - name: 检出仓库代码
+      - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 配置编译基础环境与 ZFS 驱动
+      - name: 配置 APT 与 OpenZFS
+        env:
+          SUITE: ${{ matrix.suite }}
+          BACKPORTS: ${{ matrix.backports }}
+          DEBIAN_VER: ${{ matrix.debian }}
         run: |
-          set -e
-          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
-          cat << 'ENDCAT' > /etc/apt/sources.list
-          deb http://deb.debian.org/debian bullseye main contrib non-free
-          deb http://deb.debian.org/debian bullseye-updates main contrib non-free
-          ENDCAT
-          rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          set -euxo pipefail
+
+          if [ "$DEBIAN_VER" = "12" ]; then
+            cat > /etc/apt/sources.list <<EOF
+          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
+          EOF
+            rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          elif [ "$DEBIAN_VER" = "13" ]; then
+            cat > /etc/apt/sources.list <<EOF
+          deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian trixie-backports main contrib non-free non-free-firmware
+          EOF
+            rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          else
+            cat > /etc/apt/sources.list <<EOF
+          deb http://deb.debian.org/debian forky main contrib non-free non-free-firmware
+          EOF
+            rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          fi
 
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
-            libc6=2.31-13+deb11u11 libc-bin=2.31-13+deb11u11 perl-base=5.32.1-4+deb11u3
-
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc python3 \
-            linux-kbuild-5.10 linux-compiler-gcc-10-x86 zfs-dkms
+            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc \
+            python3 file xz-utils kmod
+
+          # Debian 12 需要 backports ZFS 才能覆盖较新的 backports 内核。
+          # Debian 13 当前稳定版 ZFS 已支持当前 7.x backports，因此保持稳定版 ZFS。
+          if [ "$DEBIAN_VER" = "12" ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -t bookworm-backports zfs-dkms
+          else
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zfs-dkms
+          fi
+
+          # 安装 headers 时不要让 DKMS 自动重复编译；后面我们显式 dkms build。
+          chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
+
+      - name: 扫描、编译、打包全部当前可用内核
+        run: |
+          set -uo pipefail
+          mkdir -p output
+
+          ZFS_VER=$(find /usr/src -maxdepth 1 -type d -name 'zfs-*' -printf '%f\n' 2>/dev/null | sed 's/^zfs-//' | sort -V | tail -n1)
+          if [ -z "$ZFS_VER" ]; then
+            echo "错误：未找到 /usr/src/zfs-*"
+            exit 1
+          fi
+          echo "====> ZFS DKMS: ${ZFS_VER} <===="
+
+          mapfile -t KERNELS < <(
+            apt-cache --names-only search '^linux-headers-[0-9]' \
+              | awk '{print $1}' \
+              | sed 's/^linux-headers-//' \
+              | grep -E '^[0-9]+\.[0-9]+.*-(amd64|cloud-amd64|rt-amd64)$' \
+              | grep -v -E '^[0-9]+\.[0-9]+-(amd64|cloud-amd64|rt-amd64)$' \
+              | sort -uV
+          )
+
+          echo "发现 ${#KERNELS[@]} 个当前 APT 可见的 Debian x86_64 内核："
+          printf '  %s\n' "${KERNELS[@]}"
+
+          for kver in "${KERNELS[@]}"; do
+            echo
+            echo "============================================================"
+            echo ">>> ${kver}"
+
+            ASSET="zfs-modules-${kver}.tar.gz"
+            URL="https://github.com/${{ github.repository }}/releases/download/debian-ZFS/${ASSET}"
+
+            if curl --http1.1 -sSfL -I "$URL" >/dev/null 2>&1; then
+              echo "✓ Release 已存在，跳过"
+              continue
+            fi
+
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "linux-headers-${kver}"; then
+              echo "[-] headers 安装失败：${kver}"
+              dpkg --configure -a || true
+              apt-get -f install -y || true
+              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
+              continue
+            fi
+
+            dkms remove "zfs/${ZFS_VER}" -k "$kver" >/dev/null 2>&1 || true
+            if ! dkms build "zfs/${ZFS_VER}" -k "$kver"; then
+              echo "[-] ZFS 编译失败：${kver}"
+              LOG="/var/lib/dkms/zfs/${ZFS_VER}/build/make.log"
+              [ -f "$LOG" ] && tail -n 80 "$LOG" || true
+              apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
+              rm -rf "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" || true
+              continue
+            fi
+
+            MOD_DIR=$(find "/lib/modules/${kver}" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" \
+              -type f -name 'zfs.ko*' -print 2>/dev/null | head -n1 | xargs -r dirname)
+            if [ -z "$MOD_DIR" ] || [ ! -d "$MOD_DIR" ]; then
+              echo "[-] 未找到 zfs.ko：${kver}"
+              continue
+            fi
+
+            PKG_ROOT="/tmp/zfs-pack-${kver}"
+            PKG_DIR="${PKG_ROOT}/zfs-modules-${kver}"
+            rm -rf "$PKG_ROOT"
+            mkdir -p "${PKG_DIR}/modules"
+            find "$MOD_DIR" -type f -name '*.ko*' -exec cp -f {} "${PKG_DIR}/modules/" \;
+
+            cat > "${PKG_DIR}/metadata.txt" <<EOF
+          kernel_version=${kver}
+          module_path=updates/dkms
+          zfs_version=${ZFS_VER}
+          debian_version=${{ matrix.debian }}
+          EOF
+
+            tar -czf "output/${ASSET}" -C "$PKG_ROOT" "zfs-modules-${kver}"
+            echo "✓ 生成 output/${ASSET}"
+
+            apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
+            rm -rf "$PKG_ROOT" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" || true
+          done
+
+      - name: 上传当前内核到 Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        with:
+          tag_name: debian-ZFS
+          name: Debian ZFS Prebuilt Modules
+          files: output/zfs-modules-*.tar.gz
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================================
+  # Job 2: 手动历史发现
+  # 通过 Snapshot MR API 找到 Debian 12/13/14 曾经存在过的内核 headers。
+  # ============================================================================
+  discover-history:
+    name: "Discover Debian ${{ matrix.debian }} historical kernels"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill_history == true }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        debian: ['12', '13', '14']
+
+    steps:
+      - name: 从 snapshot.debian.org 生成历史内核清单
+        env:
+          TARGET_DEBIAN: ${{ matrix.debian }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+
+          target = os.environ['TARGET_DEBIAN']
+          api = 'https://snapshot.debian.org/mr'
+          ua = {'User-Agent': 'my-debian-zfs/2.0 (+GitHub Actions)'}
+
+          def get_json(url, retries=8):
+              last = None
+              for n in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers=ua)
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          return json.load(r)
+                  except Exception as e:
+                      last = e
+                      time.sleep(min(2 ** n, 20))
+              raise RuntimeError(f'GET failed: {url}: {last}')
+
+          def ver_tuple(v):
+              m = re.match(r'^(\d+)\.(\d+)(?:\.(\d+))?', v)
+              if not m:
+                  return None
+              return tuple(int(x or 0) for x in m.groups())
+
+          def source_maybe_relevant(v):
+              t = ver_tuple(v)
+              if not t or t < (6, 1, 0):
+                  return False
+              major, minor, _ = t
+
+              if target == '12':
+                  # Bookworm stable 6.1 + Bookworm backports（最高走到 6.12 系列）
+                  return (major, minor) == (6, 1) or '~bpo12' in v
+              if target == '13':
+                  # Trixie stable 6.12 + Trixie backports
+                  return (major, minor) == (6, 12) or '~bpo13' in v
+              # Forky/14：只要最终二进制名带 deb14 即会被接纳。
+              return t >= (6, 12, 0)
+
+          def belongs(kver):
+              if target == '12':
+                  m = re.match(r'^6\.1\.0-(\d+)-(?:amd64|cloud-amd64|rt-amd64)$', kver)
+                  if m:
+                      # Debian 12 正式发布使用 6.1.0-9；不回填 Debian 12 之前的 ABI 1~8。
+                      return int(m.group(1)) >= 9
+                  return 'deb12' in kver
+              if target == '13':
+                  return 'deb13' in kver
+              return 'deb14' in kver
+
+          def newer(a, b):
+              # True => Debian version a > b；使用 runner 自带 dpkg 做正确版本比较。
+              return subprocess.run(['dpkg', '--compare-versions', a, 'gt', b]).returncode == 0
+
+          print('读取 Snapshot 的 linux 源码版本索引...')
+          versions = [x['version'] for x in get_json(f'{api}/package/linux/')['result']]
+          versions = [v for v in versions if source_maybe_relevant(v)]
+          print(f'候选源码版本数: {len(versions)}')
+
+          found = {}
+          for idx, srcver in enumerate(versions, 1):
+              qver = urllib.parse.quote(srcver, safe='')
+              try:
+                  data = get_json(f'{api}/package/linux/{qver}/binpackages')
+              except Exception as e:
+                  print(f'[warn] {srcver}: {e}')
+                  continue
+
+              for item in data.get('result', []):
+                  name = item.get('name', '')
+                  m = re.match(r'^linux-headers-(.+-(?:amd64|cloud-amd64|rt-amd64))$', name)
+                  if not m:
+                      continue
+                  kver = m.group(1)
+                  if not belongs(kver):
+                      continue
+                  binver = item.get('version', '')
+                  old = found.get(kver)
+                  if old is None or (binver and newer(binver, old['binver'])):
+                      found[kver] = {'kver': kver, 'binver': binver, 'srcver': srcver}
+
+              if idx % 25 == 0:
+                  print(f'已扫描 {idx}/{len(versions)}，发现 {len(found)} 个内核')
+              time.sleep(0.08)
+
+          rows = sorted(found.values(), key=lambda x: x['kver'])
+          out = f'kernels-{target}.json'
+          with open(out, 'w') as f:
+              json.dump(rows, f, ensure_ascii=False, indent=2)
+
+          print(f'\nDebian {target}: 共发现 {len(rows)} 个历史/当前内核')
+          for x in rows:
+              print(x['kver'], '|', x['binver'], '|', x['srcver'])
+          PY
+
+      - name: 上传历史清单 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernels-${{ matrix.debian }}
+          path: kernels-${{ matrix.debian }}.json
+          retention-days: 1
+
+  # ============================================================================
+  # Job 3: Snapshot 历史回填
+  # 3 个 Debian 版本 × 3 个 x86_64 flavor 并行，避免单任务超时。
+  # ============================================================================
+  backfill-history:
+    name: "Backfill Debian ${{ matrix.debian }} / ${{ matrix.flavor }}"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill_history == true }}
+    needs: discover-history
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - debian: '12'
+            image: bookworm
+            flavor: amd64
+          - debian: '12'
+            image: bookworm
+            flavor: cloud-amd64
+          - debian: '12'
+            image: bookworm
+            flavor: rt-amd64
+          - debian: '13'
+            image: trixie
+            flavor: amd64
+          - debian: '13'
+            image: trixie
+            flavor: cloud-amd64
+          - debian: '13'
+            image: trixie
+            flavor: rt-amd64
+          - debian: '14'
+            image: forky
+            flavor: amd64
+          - debian: '14'
+            image: forky
+            flavor: cloud-amd64
+          - debian: '14'
+            image: forky
+            flavor: rt-amd64
+
+    container:
+      image: debian:${{ matrix.image }}
+      options: --privileged
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 下载历史内核清单
+        uses: actions/download-artifact@v4
+        with:
+          name: kernels-${{ matrix.debian }}
+          path: /tmp/kernel-list
+
+      - name: 配置构建环境
+        env:
+          DEBIAN_VER: ${{ matrix.debian }}
+        run: |
+          set -euxo pipefail
+
+          if [ "$DEBIAN_VER" = "12" ]; then
+            cat > /etc/apt/sources.list <<EOF
+          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
+          EOF
+            rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          elif [ "$DEBIAN_VER" = "13" ]; then
+            cat > /etc/apt/sources.list <<EOF
+          deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian trixie-backports main contrib non-free non-free-firmware
+          EOF
+            rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          else
+            cat > /etc/apt/sources.list <<EOF
+          deb http://deb.debian.org/debian forky main contrib non-free non-free-firmware
+          EOF
+            rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          fi
+
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc \
+            python3 file xz-utils kmod dpkg-dev
+
+          if [ "$DEBIAN_VER" = "12" ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -t bookworm-backports zfs-dkms
+          else
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zfs-dkms
+          fi
 
           chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
 
-      - name: 从 Snapshot 下载并编译历史内核
+      - name: 从 Snapshot 回填缺失模块
+        env:
+          TARGET_DEBIAN: ${{ matrix.debian }}
+          TARGET_FLAVOR: ${{ matrix.flavor }}
+          REPO: ${{ github.repository }}
         run: |
-          set -e
-          mkdir -p output
+          set -uo pipefail
+          mkdir -p output /tmp/snapshot-debs
 
-          python3 - << 'PYEOF'
-          import os, sys, re, time, glob, urllib.request, subprocess
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
 
-          REPO = os.environ.get("GITHUB_REPOSITORY", "")
-          START = int("${{ matrix.start }}")
-          END = int("${{ matrix.end }}")
+          target = os.environ['TARGET_DEBIAN']
+          flavor = os.environ['TARGET_FLAVOR']
+          repo = os.environ['REPO']
+          manifest = f'/tmp/kernel-list/kernels-{target}.json'
+          api = 'https://snapshot.debian.org/mr'
+          ua = {'User-Agent': 'my-debian-zfs/2.0 (+GitHub Actions)'}
+          debdir = '/tmp/snapshot-debs'
 
-          # 1. 自动定位 ZFS DKMS 源码版本号
-          zfs_dirs = glob.glob("/usr/src/zfs-*")
-          if not zfs_dirs:
-              print("[-] 错误: 未在 /usr/src/ 中找到 zfs 源码目录")
-              sys.exit(1)
-          ZFS_VER = os.path.basename(zfs_dirs[0]).replace("zfs-", "")
-          print(f"====> 检测到 ZFS DKMS 版本: {ZFS_VER} <====")
+          def sh(cmd, check=False, capture=False):
+              if capture:
+                  return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+              return subprocess.run(cmd, check=check)
 
-          # 2. 探测包在 Release 中是否已存在
-          def is_already_released(kver):
-              if not REPO:
-                  return False
-              url = f"https://github.com/{REPO}/releases/download/debian-ZFS/zfs-modules-{kver}.tar.gz"
-              res = subprocess.run(["curl", "-sSfL", "-I", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              return res.returncode == 0
-
-          # 3. 安全下载 deb（强制使用 HTTP/1.1 避免 snapshot 站点的 HTTP/2 协议 92 错误）
-          def download_snapshot_deb(url, target_path):
-              if os.path.exists(target_path):
+          def get_json(url, retries=8):
+              last = None
+              for n in range(retries):
                   try:
-                      os.remove(target_path)
-                  except Exception:
+                      req = urllib.request.Request(url, headers=ua)
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          return json.load(r)
+                  except Exception as e:
+                      last = e
+                      time.sleep(min(2 ** n, 20))
+              raise RuntimeError(f'GET failed: {url}: {last}')
+
+          def released(kver):
+              url = f'https://github.com/{repo}/releases/download/debian-ZFS/zfs-modules-{kver}.tar.gz'
+              return sh(['curl', '--http1.1', '-sSfL', '-I', url]).returncode == 0
+
+          def newest_version(records):
+              best = None
+              for r in records:
+                  v = r.get('binary_version', '')
+                  if not v:
+                      continue
+                  if best is None:
+                      best = r
+                      continue
+                  if sh(['dpkg', '--compare-versions', v, 'gt', best['binary_version']]).returncode == 0:
+                      best = r
+              return best
+
+          def find_binary_version(pkg, srcver, exact=None):
+              qpkg = urllib.parse.quote(pkg, safe='')
+              data = get_json(f'{api}/binary/{qpkg}/')
+              rows = data.get('result', [])
+              if exact:
+                  exact_rows = [r for r in rows if r.get('binary_version') == exact]
+                  if exact_rows:
+                      same = [r for r in exact_rows if r.get('source') == 'linux' and r.get('version') == srcver]
+                      return newest_version(same or exact_rows)['binary_version']
+              same = [r for r in rows if r.get('source') == 'linux' and r.get('version') == srcver]
+              if same:
+                  return newest_version(same)['binary_version']
+              return None
+
+          def download_binary(pkg, binver):
+              safe_name = re.sub(r'[^A-Za-z0-9_.+-]+', '_', f'{pkg}_{binver}')
+              cached = os.path.join(debdir, safe_name + '.deb')
+              if os.path.exists(cached) and os.path.getsize(cached) > 1024:
+                  return cached
+
+              qpkg = urllib.parse.quote(pkg, safe='')
+              qver = urllib.parse.quote(binver, safe='')
+              data = get_json(f'{api}/binary/{qpkg}/{qver}/binfiles?fileinfo=1')
+              results = data.get('result', [])
+              fileinfo = data.get('fileinfo', {})
+
+              # 外层 headers / kbuild 主要取 amd64；common/base 可能是 all。
+              preferred = [x for x in results if x.get('architecture') == 'amd64']
+              if not preferred:
+                  preferred = [x for x in results if x.get('architecture') == 'all']
+              if not preferred:
+                  raise RuntimeError(f'没有 amd64/all 文件: {pkg}={binver}')
+
+              h = preferred[0]['hash']
+              infos = fileinfo.get(h, [])
+              filename = infos[0].get('name') if infos else (safe_name + '.deb')
+              url = f'https://snapshot.debian.org/file/{h}/{urllib.parse.quote(filename)}'
+              tmp = cached + '.tmp'
+              rc = sh([
+                  'curl', '--http1.1', '-fL', '--retry', '8', '--retry-all-errors',
+                  '--retry-delay', '2', '--max-time', '240', '-A', ua['User-Agent'],
+                  url, '-o', tmp
+              ]).returncode
+              if rc != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
+                  raise RuntimeError(f'下载失败: {pkg}={binver}')
+              os.replace(tmp, cached)
+              return cached
+
+          dep_re = re.compile(r'(?P<pkg>(?:linux-(?:headers|kbuild|base|support)-[A-Za-z0-9.+~-]+))\s*(?:\(\s*=\s*(?P<ver>[^)]+)\))?')
+          gcc_re = re.compile(r'\b(gcc-[0-9]+(?:-for-host)?)\b')
+
+          def extract_header_tree(kver, header_binver, srcver):
+              root_pkg = f'linux-headers-{kver}'
+              queue = [(root_pkg, header_binver)]
+              seen = set()
+              compilers = set()
+
+              while queue:
+                  pkg, binver = queue.pop(0)
+                  key = (pkg, binver)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+
+                  deb = download_binary(pkg, binver)
+                  meta = sh(['dpkg-deb', '-f', deb, 'Depends'], capture=True)
+                  depends = meta.stdout if meta.returncode == 0 else ''
+                  compilers.update(gcc_re.findall(depends))
+
+                  # 不执行旧包 maintainer scripts，直接抽取编译所需文件。
+                  sh(['dpkg-deb', '-x', deb, '/'], check=True)
+
+                  for m in dep_re.finditer(depends):
+                      dep = m.group('pkg')
+                      exact = (m.group('ver') or '').strip() or None
+                      depver = find_binary_version(dep, srcver, exact)
+                      if depver:
+                          queue.append((dep, depver))
+
+              # 尽量安装内核当年要求的编译器；不存在时继续使用发行版默认 gcc。
+              for cc in sorted(compilers):
+                  sh(['apt-get', 'install', '-y', '--no-install-recommends', cc])
+
+              hdr = f'/usr/src/linux-headers-{kver}'
+              if not os.path.isdir(hdr):
+                  raise RuntimeError(f'抽取后仍未找到 {hdr}')
+              os.makedirs(f'/lib/modules/{kver}', exist_ok=True)
+              for link in ('build', 'source'):
+                  p = f'/lib/modules/{kver}/{link}'
+                  try:
+                      if os.path.lexists(p):
+                          os.unlink(p)
+                      os.symlink(hdr, p)
+                  except FileExistsError:
                       pass
-              cmd = [
-                  "curl", "--http1.1", "-sSL",
-                  "--retry", "5", "--retry-delay", "3",
-                  "--max-time", "180",
-                  "-A", "Mozilla/5.0 (X11; Linux x86_64)",
-                  url, "-o", target_path
-              ]
-              res = subprocess.run(cmd)
-              if res.returncode == 0 and os.path.exists(target_path) and os.path.getsize(target_path) > 1024:
-                  return True
-              return False
 
-          # 4. 从 snapshot.debian.org 解析并安装 deb
-          def install_snapshot_headers(kver, base_ver):
-              pkg_url = f"https://snapshot.debian.org/binary/linux-headers-{kver}/"
-              req = urllib.request.Request(pkg_url, headers={"User-Agent": "Mozilla/5.0"})
+          def zfs_version():
+              dirs = []
+              for name in os.listdir('/usr/src'):
+                  if name.startswith('zfs-') and os.path.isdir('/usr/src/' + name):
+                      dirs.append(name[4:])
+              if not dirs:
+                  raise RuntimeError('找不到 /usr/src/zfs-*')
+              # dpkg --compare-versions 排序
+              best = dirs[0]
+              for v in dirs[1:]:
+                  if sh(['dpkg', '--compare-versions', v, 'gt', best]).returncode == 0:
+                      best = v
+              return best
+
+          def build_one(kver, header_binver, srcver, zver):
+              print('\n' + '=' * 68)
+              print(f'>>> {kver}  header={header_binver}  source={srcver}')
+
+              if released(kver):
+                  print('✓ Release 已存在，跳过')
+                  return
+
               try:
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-                      html = resp.read().decode("utf-8", errors="ignore")
+                  extract_header_tree(kver, header_binver, srcver)
               except Exception as e:
-                  print(f"[-] 快照库未收录: {kver} ({e})")
-                  return False
+                  print(f'[-] headers 准备失败: {e}')
+                  return
 
-              m = re.search(r'href="(?:\.\./\.\./)?package/linux/([^/#"]+)/', html)
-              if not m:
-                  print(f"[-] 未定位到源码包版本: {kver}")
-                  return False
-              src_ver = m.group(1)
+              sh(['dkms', 'remove', f'zfs/{zver}', '-k', kver])
+              rc = sh(['dkms', 'build', f'zfs/{zver}', '-k', kver]).returncode
+              if rc != 0:
+                  print(f'[-] DKMS 编译失败: {kver}')
+                  log = f'/var/lib/dkms/zfs/{zver}/build/make.log'
+                  if os.path.isfile(log):
+                      with open(log, errors='ignore') as f:
+                          print(''.join(f.readlines()[-80:]))
+                  return
 
-              common_pkg = f"linux-headers-{base_ver}-common"
-              src_url = f"https://snapshot.debian.org/package/linux/{src_ver}/"
-              req_src = urllib.request.Request(src_url, headers={"User-Agent": "Mozilla/5.0"})
-              try:
-                  with urllib.request.urlopen(req_src, timeout=20) as resp:
-                      src_html = resp.read().decode("utf-8", errors="ignore")
-              except Exception as e:
-                  print(f"[-] 无法读取版本详情页: {src_url} ({e})")
-                  return False
+              cmd = f'''find /lib/modules/{kver} /var/lib/dkms/zfs/{zver}/{kver} -type f -name "zfs.ko*" 2>/dev/null | head -n1'''
+              p = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE)
+              zfsko = p.stdout.strip()
+              if not zfsko:
+                  print(f'[-] 未找到 zfs.ko: {kver}')
+                  return
+              moddir = os.path.dirname(zfsko)
 
-              common_match = re.search(r'href="([^"]*/' + re.escape(common_pkg) + r'_[^"]*_all\.deb)"', src_html)
-              arch_match = re.search(r'href="([^"]*/linux-headers-' + re.escape(kver) + r'_[^"]*_amd64\.deb)"', src_html)
+              root = f'/tmp/zfs-pack-{kver}'
+              pkgdir = f'{root}/zfs-modules-{kver}'
+              shutil.rmtree(root, ignore_errors=True)
+              os.makedirs(f'{pkgdir}/modules', exist_ok=True)
 
-              if not common_match or not arch_match:
-                  print(f"[-] 未能在版本页提取到 .deb 链接: {kver}")
-                  return False
+              for name in os.listdir(moddir):
+                  if '.ko' in name:
+                      src = os.path.join(moddir, name)
+                      if os.path.isfile(src):
+                          shutil.copy2(src, f'{pkgdir}/modules/{name}')
 
-              common_url = "https://snapshot.debian.org" + common_match.group(1)
-              arch_url = "https://snapshot.debian.org" + arch_match.group(1)
+              with open(f'{pkgdir}/metadata.txt', 'w') as f:
+                  f.write(f'kernel_version={kver}\n')
+                  f.write('module_path=updates/dkms\n')
+                  f.write(f'zfs_version={zver}\n')
+                  f.write(f'debian_version={target}\n')
+                  f.write('source=snapshot.debian.org\n')
 
-              print(f"[+] 正在从快照库拉取: {common_pkg} & linux-headers-{kver}...")
-              if not download_snapshot_deb(common_url, "/tmp/common.deb"):
-                  print(f"[-] 下载 common 包失败: {kver}")
-                  return False
-              if not download_snapshot_deb(arch_url, "/tmp/arch.deb"):
-                  print(f"[-] 下载 arch 包失败: {kver}")
-                  return False
+              out = f'output/zfs-modules-{kver}.tar.gz'
+              sh(['tar', '-czf', out, '-C', root, f'zfs-modules-{kver}'], check=True)
+              print(f'✓ 生成 {out}')
 
-              res = subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", "/tmp/common.deb", "/tmp/arch.deb"])
-              if res.returncode != 0:
-                  print(f"[-] 安装 deb 失败: {kver}")
-                  subprocess.run("dpkg --configure -a || true", shell=True)
-                  subprocess.run("apt-get -f install -y || true", shell=True)
-                  subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                  return False
-              return True
+              shutil.rmtree(root, ignore_errors=True)
+              shutil.rmtree(f'/var/lib/dkms/zfs/{zver}/{kver}', ignore_errors=True)
 
-          # 5. 遍历指定范围编译
-          for num in range(START, END):
-              base_ver = f"5.10.0-{num}"
-              for flavor in ["amd64", "cloud-amd64"]:
-                  kver = f"{base_ver}-{flavor}"
-                  print(f"\n============================================================")
-                  print(f">>> 正在检查: {kver}")
+          with open(manifest) as f:
+              rows = json.load(f)
 
-                  if is_already_released(kver):
-                      print(f"✓ 已在 Release 中存在，跳过编译")
-                      continue
+          suffix = '-' + flavor
+          rows = [r for r in rows if r['kver'].endswith(suffix)]
+          print(f'Debian {target} / {flavor}: 清单中 {len(rows)} 个内核')
 
-                  if not install_snapshot_headers(kver, base_ver):
-                      continue
+          zver = zfs_version()
+          print(f'ZFS DKMS: {zver}')
+          for r in rows:
+              build_one(r['kver'], r['binver'], r['srcver'], zver)
+          PY
 
-                  print(f"[+] 开始 DKMS 编译: {kver} (ZFS: {ZFS_VER})...")
-                  subprocess.run(f"dkms remove zfs/{ZFS_VER} -k {kver} 2>/dev/null || true", shell=True)
-                  res_build = subprocess.run(f"dkms build zfs/{ZFS_VER} -k {kver}", shell=True)
-                  if res_build.returncode != 0:
-                      print(f"[-] 编译 {kver} 失败，清理并跳过")
-                      log_path = f"/var/lib/dkms/zfs/{ZFS_VER}/build/make.log"
-                      if os.path.exists(log_path):
-                          with open(log_path, "r", errors="ignore") as lf:
-                              print("----- make.log (last 20 lines) -----")
-                              print("".join(lf.readlines()[-20:]))
-                      subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                      subprocess.run(f"rm -rf /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
-                      continue
-
-                  mod_dir = subprocess.getoutput(f'find /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver} -name "zfs.ko*" 2>/dev/null | head -n1 | xargs -r dirname')
-                  if not mod_dir or not os.path.exists(mod_dir):
-                      print(f"[-] 未找到编译出的驱动模块")
-                      subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                      continue
-
-                  pack_dir = f"/tmp/zfs-pack-{kver}/zfs-modules-{kver}"
-                  os.makedirs(f"{pack_dir}/modules", exist_ok=True)
-                  subprocess.run(f'find "{mod_dir}" -name "*.ko*" -type f -exec cp {{}} "{pack_dir}/modules/" \\;', shell=True)
-
-                  with open(f"{pack_dir}/metadata.txt", "w") as f:
-                      f.write(f"kernel_version={kver}\nmodule_path=updates/dkms\nzfs_version={ZFS_VER}\n")
-
-                  subprocess.run(f'tar -czf "output/zfs-modules-{kver}.tar.gz" -C "/tmp/zfs-pack-{kver}" "zfs-modules-{kver}"', shell=True)
-                  print(f"✓ 成功打包: output/zfs-modules-{kver}.tar.gz")
-
-                  subprocess.run(f"apt-get purge -y linux-headers-{base_ver}* >/dev/null 2>&1 || true", shell=True)
-                  subprocess.run(f"rm -rf /tmp/zfs-pack-{kver} /tmp/*.deb /lib/modules/{kver} /var/lib/dkms/zfs/{ZFS_VER}/{kver}", shell=True)
-                  time.sleep(1)
-          PYEOF
-
-      - name: 上传快照内核包到 Release
+      - name: 上传历史模块到 Release
         uses: softprops/action-gh-release@v2
-        if: success()
+        if: always()
         with:
           tag_name: debian-ZFS
-          name: "Debian ZFS Prebuilt Modules"
+          name: Debian ZFS Prebuilt Modules
           files: output/zfs-modules-*.tar.gz
           fail_on_unmatched_files: false
         env:
