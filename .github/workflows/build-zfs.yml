@@ -17,8 +17,10 @@ permissions:
 # 说明：
 # 1. 仅覆盖 Debian 官方 x86_64 内核：amd64 / cloud-amd64 / rt-amd64。
 # 2. 不包含 Proxmox VE 的 *-pve 内核；PVE 应单独建立 workflow。
-# 3. 每周任务扫描 Debian 12 / 13 / 14 当前仓库（含 backports）。
-# 4. 手动运行时勾选 backfill_history，可从 snapshot.debian.org 回填已从 APT 索引淘汰的历史内核。
+# 3. Debian 构建环境通过 docker run 启动，而不是 GitHub Actions 的 job.container。
+#    这样 GitHub 的 Node 24 Actions 始终运行在 ubuntu-latest 宿主机，避免 Debian 12
+#    容器内出现 /__e/node24/bin/node: no such file or directory。
+# 4. Snapshot 下载全部使用 Python urllib，不再依赖 Python subprocess 调 curl。
 
 jobs:
   # ============================================================================
@@ -44,24 +46,27 @@ jobs:
             suite: forky
             backports: ''
 
-    container:
-      image: debian:${{ matrix.image }}
-      options: --privileged
-
-    defaults:
-      run:
-        shell: bash
-
     steps:
-      - name: 检出仓库
-        uses: actions/checkout@v4
-
-      - name: 配置 APT 与 OpenZFS
+      - name: 在 Debian 容器中扫描、编译、打包当前内核
         env:
+          DEBIAN_VER: ${{ matrix.debian }}
+          IMAGE: ${{ matrix.image }}
           SUITE: ${{ matrix.suite }}
           BACKPORTS: ${{ matrix.backports }}
-          DEBIAN_VER: ${{ matrix.debian }}
         run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/output"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          docker pull "debian:${IMAGE}"
+          docker run --rm --privileged \
+            -e DEBIAN_VER="$DEBIAN_VER" \
+            -e SUITE="$SUITE" \
+            -e BACKPORTS="$BACKPORTS" \
+            -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            "debian:${IMAGE}" bash -s <<'CONTAINER'
           set -euxo pipefail
 
           if [ "$DEBIAN_VER" = "12" ]; then
@@ -92,8 +97,6 @@ jobs:
             build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc \
             python3 file xz-utils kmod
 
-          # Debian 12 需要 backports ZFS 才能覆盖较新的 backports 内核。
-          # Debian 13 当前稳定版 ZFS 已支持当前 7.x backports，因此保持稳定版 ZFS。
           if [ "$DEBIAN_VER" = "12" ]; then
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               -t bookworm-backports zfs-dkms
@@ -101,12 +104,7 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zfs-dkms
           fi
 
-          # 安装 headers 时不要让 DKMS 自动重复编译；后面我们显式 dkms build。
           chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 扫描、编译、打包全部当前可用内核
-        run: |
-          set -uo pipefail
           mkdir -p output
 
           ZFS_VER=$(find /usr/src -maxdepth 1 -type d -name 'zfs-*' -printf '%f\n' 2>/dev/null | sed 's/^zfs-//' | sort -V | tail -n1)
@@ -134,7 +132,7 @@ jobs:
             echo ">>> ${kver}"
 
             ASSET="zfs-modules-${kver}.tar.gz"
-            URL="https://github.com/${{ github.repository }}/releases/download/debian-ZFS/${ASSET}"
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/debian-ZFS/${ASSET}"
 
             if curl --http1.1 -sSfL -I "$URL" >/dev/null 2>&1; then
               echo "✓ Release 已存在，跳过"
@@ -176,7 +174,7 @@ jobs:
           kernel_version=${kver}
           module_path=updates/dkms
           zfs_version=${ZFS_VER}
-          debian_version=${{ matrix.debian }}
+          debian_version=${DEBIAN_VER}
           EOF
 
             tar -czf "output/${ASSET}" -C "$PKG_ROOT" "zfs-modules-${kver}"
@@ -185,21 +183,22 @@ jobs:
             apt-get purge -y "linux-headers-${kver}" >/dev/null 2>&1 || true
             rm -rf "$PKG_ROOT" "/var/lib/dkms/zfs/${ZFS_VER}/${kver}" || true
           done
+          CONTAINER
 
       - name: 上传当前内核到 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: always()
         with:
           tag_name: debian-ZFS
           name: Debian ZFS Prebuilt Modules
           files: output/zfs-modules-*.tar.gz
           fail_on_unmatched_files: false
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ============================================================================
   # Job 2: 手动历史发现
-  # 通过 Snapshot MR API 找到 Debian 12/13/14 曾经存在过的内核 headers。
   # ============================================================================
   discover-history:
     name: "Discover Debian ${{ matrix.debian }} historical kernels"
@@ -227,7 +226,7 @@ jobs:
 
           target = os.environ['TARGET_DEBIAN']
           api = 'https://snapshot.debian.org/mr'
-          ua = {'User-Agent': 'my-debian-zfs/2.0 (+GitHub Actions)'}
+          ua = {'User-Agent': 'my-debian-zfs/2.1 (+GitHub Actions)'}
 
           def get_json(url, retries=8):
               last = None
@@ -252,21 +251,17 @@ jobs:
               if not t or t < (6, 1, 0):
                   return False
               major, minor, _ = t
-
               if target == '12':
-                  # Bookworm stable 6.1 + Bookworm backports（最高走到 6.12 系列）
                   return (major, minor) == (6, 1) or '~bpo12' in v
               if target == '13':
-                  # Trixie stable 6.12 + Trixie backports
                   return (major, minor) == (6, 12) or '~bpo13' in v
-              # Forky/14：只要最终二进制名带 deb14 即会被接纳。
               return t >= (6, 12, 0)
 
           def belongs(kver):
               if target == '12':
                   m = re.match(r'^6\.1\.0-(\d+)-(?:amd64|cloud-amd64|rt-amd64)$', kver)
                   if m:
-                      # Debian 12 正式发布使用 6.1.0-9；不回填 Debian 12 之前的 ABI 1~8。
+                      # Debian 12 正式发布从 ABI 9 开始；1~8 不回填。
                       return int(m.group(1)) >= 9
                   return 'deb12' in kver
               if target == '13':
@@ -274,7 +269,6 @@ jobs:
               return 'deb14' in kver
 
           def newer(a, b):
-              # True => Debian version a > b；使用 runner 自带 dpkg 做正确版本比较。
               return subprocess.run(['dpkg', '--compare-versions', a, 'gt', b]).returncode == 0
 
           print('读取 Snapshot 的 linux 源码版本索引...')
@@ -319,7 +313,7 @@ jobs:
           PY
 
       - name: 上传历史清单 Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: kernels-${{ matrix.debian }}
           path: kernels-${{ matrix.debian }}.json
@@ -327,7 +321,6 @@ jobs:
 
   # ============================================================================
   # Job 3: Snapshot 历史回填
-  # 3 个 Debian 版本 × 3 个 x86_64 flavor 并行，避免单任务超时。
   # ============================================================================
   backfill-history:
     name: "Backfill Debian ${{ matrix.debian }} / ${{ matrix.flavor }}"
@@ -367,28 +360,35 @@ jobs:
             image: forky
             flavor: rt-amd64
 
-    container:
-      image: debian:${{ matrix.image }}
-      options: --privileged
-
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: 下载历史内核清单
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: kernels-${{ matrix.debian }}
-          path: /tmp/kernel-list
+          path: kernel-list
 
-      - name: 配置构建环境
+      - name: 在 Debian 容器中从 Snapshot 回填缺失模块
         env:
-          DEBIAN_VER: ${{ matrix.debian }}
+          TARGET_DEBIAN: ${{ matrix.debian }}
+          TARGET_FLAVOR: ${{ matrix.flavor }}
+          IMAGE: ${{ matrix.image }}
+          REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/output"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          docker pull "debian:${IMAGE}"
+          docker run --rm --privileged \
+            -e TARGET_DEBIAN="$TARGET_DEBIAN" \
+            -e TARGET_FLAVOR="$TARGET_FLAVOR" \
+            -e REPO="$REPO" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            "debian:${IMAGE}" bash -s <<'CONTAINER'
           set -euxo pipefail
 
-          if [ "$DEBIAN_VER" = "12" ]; then
+          if [ "$TARGET_DEBIAN" = "12" ]; then
             cat > /etc/apt/sources.list <<EOF
           deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
@@ -396,7 +396,7 @@ jobs:
           deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware
           EOF
             rm -f /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-          elif [ "$DEBIAN_VER" = "13" ]; then
+          elif [ "$TARGET_DEBIAN" = "13" ]; then
             cat > /etc/apt/sources.list <<EOF
           deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
@@ -416,7 +416,7 @@ jobs:
             build-essential dkms git bash curl ca-certificates tar gzip sed gawk bc \
             python3 file xz-utils kmod dpkg-dev
 
-          if [ "$DEBIAN_VER" = "12" ]; then
+          if [ "$TARGET_DEBIAN" = "12" ]; then
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               -t bookworm-backports zfs-dkms
           else
@@ -424,15 +424,11 @@ jobs:
           fi
 
           chmod -x /etc/kernel/header_postinst.d/dkms 2>/dev/null || true
-
-      - name: 从 Snapshot 回填缺失模块
-        env:
-          TARGET_DEBIAN: ${{ matrix.debian }}
-          TARGET_FLAVOR: ${{ matrix.flavor }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
           mkdir -p output /tmp/snapshot-debs
+
+          command -v python3
+          command -v dkms
+          command -v curl
 
           python3 - <<'PY'
           import json
@@ -440,17 +436,17 @@ jobs:
           import re
           import shutil
           import subprocess
-          import sys
           import time
+          import urllib.error
           import urllib.parse
           import urllib.request
 
           target = os.environ['TARGET_DEBIAN']
           flavor = os.environ['TARGET_FLAVOR']
           repo = os.environ['REPO']
-          manifest = f'/tmp/kernel-list/kernels-{target}.json'
+          manifest = f'/work/kernel-list/kernels-{target}.json'
           api = 'https://snapshot.debian.org/mr'
-          ua = {'User-Agent': 'my-debian-zfs/2.0 (+GitHub Actions)'}
+          ua = {'User-Agent': 'my-debian-zfs/2.1 (+GitHub Actions)'}
           debdir = '/tmp/snapshot-debs'
 
           def sh(cmd, check=False, capture=False):
@@ -472,7 +468,18 @@ jobs:
 
           def released(kver):
               url = f'https://github.com/{repo}/releases/download/debian-ZFS/zfs-modules-{kver}.tar.gz'
-              return sh(['curl', '--http1.1', '-sSfL', '-I', url]).returncode == 0
+              req = urllib.request.Request(url, headers=ua, method='HEAD')
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return 200 <= r.status < 400
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return False
+                  print(f'[warn] Release 检查 HTTP {e.code}: {kver}')
+                  return False
+              except Exception as e:
+                  print(f'[warn] Release 检查失败，按不存在处理: {kver}: {e}')
+                  return False
 
           def newest_version(records):
               best = None
@@ -495,11 +502,34 @@ jobs:
                   exact_rows = [r for r in rows if r.get('binary_version') == exact]
                   if exact_rows:
                       same = [r for r in exact_rows if r.get('source') == 'linux' and r.get('version') == srcver]
-                      return newest_version(same or exact_rows)['binary_version']
+                      best = newest_version(same or exact_rows)
+                      return best['binary_version'] if best else None
               same = [r for r in rows if r.get('source') == 'linux' and r.get('version') == srcver]
               if same:
-                  return newest_version(same)['binary_version']
+                  best = newest_version(same)
+                  return best['binary_version'] if best else None
               return None
+
+          def download_url(url, target_path, retries=8):
+              last = None
+              tmp = target_path + '.tmp'
+              for n in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers=ua)
+                      with urllib.request.urlopen(req, timeout=240) as r, open(tmp, 'wb') as f:
+                          shutil.copyfileobj(r, f, length=1024 * 1024)
+                      if os.path.getsize(tmp) < 1024:
+                          raise RuntimeError('下载文件过小')
+                      os.replace(tmp, target_path)
+                      return
+                  except Exception as e:
+                      last = e
+                      try:
+                          os.remove(tmp)
+                      except FileNotFoundError:
+                          pass
+                      time.sleep(min(2 ** n, 20))
+              raise RuntimeError(f'下载失败: {url}: {last}')
 
           def download_binary(pkg, binver):
               safe_name = re.sub(r'[^A-Za-z0-9_.+-]+', '_', f'{pkg}_{binver}')
@@ -513,7 +543,6 @@ jobs:
               results = data.get('result', [])
               fileinfo = data.get('fileinfo', {})
 
-              # 外层 headers / kbuild 主要取 amd64；common/base 可能是 all。
               preferred = [x for x in results if x.get('architecture') == 'amd64']
               if not preferred:
                   preferred = [x for x in results if x.get('architecture') == 'all']
@@ -524,15 +553,7 @@ jobs:
               infos = fileinfo.get(h, [])
               filename = infos[0].get('name') if infos else (safe_name + '.deb')
               url = f'https://snapshot.debian.org/file/{h}/{urllib.parse.quote(filename)}'
-              tmp = cached + '.tmp'
-              rc = sh([
-                  'curl', '--http1.1', '-fL', '--retry', '8', '--retry-all-errors',
-                  '--retry-delay', '2', '--max-time', '240', '-A', ua['User-Agent'],
-                  url, '-o', tmp
-              ]).returncode
-              if rc != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
-                  raise RuntimeError(f'下载失败: {pkg}={binver}')
-              os.replace(tmp, cached)
+              download_url(url, cached)
               return cached
 
           dep_re = re.compile(r'(?P<pkg>(?:linux-(?:headers|kbuild|base|support)-[A-Za-z0-9.+~-]+))\s*(?:\(\s*=\s*(?P<ver>[^)]+)\))?')
@@ -556,7 +577,7 @@ jobs:
                   depends = meta.stdout if meta.returncode == 0 else ''
                   compilers.update(gcc_re.findall(depends))
 
-                  # 不执行旧包 maintainer scripts，直接抽取编译所需文件。
+                  # 只解包，不运行旧包 maintainer scripts。
                   sh(['dpkg-deb', '-x', deb, '/'], check=True)
 
                   for m in dep_re.finditer(depends):
@@ -566,22 +587,19 @@ jobs:
                       if depver:
                           queue.append((dep, depver))
 
-              # 尽量安装内核当年要求的编译器；不存在时继续使用发行版默认 gcc。
               for cc in sorted(compilers):
                   sh(['apt-get', 'install', '-y', '--no-install-recommends', cc])
 
               hdr = f'/usr/src/linux-headers-{kver}'
               if not os.path.isdir(hdr):
                   raise RuntimeError(f'抽取后仍未找到 {hdr}')
+
               os.makedirs(f'/lib/modules/{kver}', exist_ok=True)
               for link in ('build', 'source'):
                   p = f'/lib/modules/{kver}/{link}'
-                  try:
-                      if os.path.lexists(p):
-                          os.unlink(p)
-                      os.symlink(hdr, p)
-                  except FileExistsError:
-                      pass
+                  if os.path.lexists(p):
+                      os.unlink(p)
+                  os.symlink(hdr, p)
 
           def zfs_version():
               dirs = []
@@ -590,7 +608,6 @@ jobs:
                       dirs.append(name[4:])
               if not dirs:
                   raise RuntimeError('找不到 /usr/src/zfs-*')
-              # dpkg --compare-versions 排序
               best = dirs[0]
               for v in dirs[1:]:
                   if sh(['dpkg', '--compare-versions', v, 'gt', best]).returncode == 0:
@@ -598,34 +615,34 @@ jobs:
               return best
 
           def build_one(kver, header_binver, srcver, zver):
-              print('\n' + '=' * 68)
-              print(f'>>> {kver}  header={header_binver}  source={srcver}')
+              print('\n' + '=' * 68, flush=True)
+              print(f'>>> {kver}  header={header_binver}  source={srcver}', flush=True)
 
               if released(kver):
-                  print('✓ Release 已存在，跳过')
+                  print('✓ Release 已存在，跳过', flush=True)
                   return
 
               try:
                   extract_header_tree(kver, header_binver, srcver)
               except Exception as e:
-                  print(f'[-] headers 准备失败: {e}')
+                  print(f'[-] headers 准备失败: {e}', flush=True)
                   return
 
               sh(['dkms', 'remove', f'zfs/{zver}', '-k', kver])
               rc = sh(['dkms', 'build', f'zfs/{zver}', '-k', kver]).returncode
               if rc != 0:
-                  print(f'[-] DKMS 编译失败: {kver}')
+                  print(f'[-] DKMS 编译失败: {kver}', flush=True)
                   log = f'/var/lib/dkms/zfs/{zver}/build/make.log'
                   if os.path.isfile(log):
                       with open(log, errors='ignore') as f:
-                          print(''.join(f.readlines()[-80:]))
+                          print(''.join(f.readlines()[-80:]), flush=True)
                   return
 
               cmd = f'''find /lib/modules/{kver} /var/lib/dkms/zfs/{zver}/{kver} -type f -name "zfs.ko*" 2>/dev/null | head -n1'''
               p = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE)
               zfsko = p.stdout.strip()
               if not zfsko:
-                  print(f'[-] 未找到 zfs.ko: {kver}')
+                  print(f'[-] 未找到 zfs.ko: {kver}', flush=True)
                   return
               moddir = os.path.dirname(zfsko)
 
@@ -647,33 +664,38 @@ jobs:
                   f.write(f'debian_version={target}\n')
                   f.write('source=snapshot.debian.org\n')
 
-              out = f'output/zfs-modules-{kver}.tar.gz'
+              out = f'/work/output/zfs-modules-{kver}.tar.gz'
               sh(['tar', '-czf', out, '-C', root, f'zfs-modules-{kver}'], check=True)
-              print(f'✓ 生成 {out}')
+              print(f'✓ 生成 {out}', flush=True)
 
               shutil.rmtree(root, ignore_errors=True)
               shutil.rmtree(f'/var/lib/dkms/zfs/{zver}/{kver}', ignore_errors=True)
+
+          if not os.path.isfile(manifest):
+              raise RuntimeError(f'历史清单不存在: {manifest}')
 
           with open(manifest) as f:
               rows = json.load(f)
 
           suffix = '-' + flavor
           rows = [r for r in rows if r['kver'].endswith(suffix)]
-          print(f'Debian {target} / {flavor}: 清单中 {len(rows)} 个内核')
+          print(f'Debian {target} / {flavor}: 清单中 {len(rows)} 个内核', flush=True)
 
           zver = zfs_version()
-          print(f'ZFS DKMS: {zver}')
+          print(f'ZFS DKMS: {zver}', flush=True)
           for r in rows:
               build_one(r['kver'], r['binver'], r['srcver'], zver)
           PY
+          CONTAINER
 
       - name: 上传历史模块到 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: always()
         with:
           tag_name: debian-ZFS
           name: Debian ZFS Prebuilt Modules
           files: output/zfs-modules-*.tar.gz
           fail_on_unmatched_files: false
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
